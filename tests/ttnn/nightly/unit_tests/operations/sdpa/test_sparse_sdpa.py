@@ -311,6 +311,98 @@ def test_sparse_sdpa_perf_scaled_fp8_production(device, H):
     _run_sparse_sdpa_perf(device, H, 640, 56320, 2048, 256, "dense", "scaled_fp8")
 
 
+# ---- Report-only perf table: logs device time (median of 5 realtime-profiler samples) and the achieved
+#      DRAM bandwidth against peak. Add a row to SPARSE_PERF_CASES to profile a new shape. S may be an int or
+#      "<n>cores" (n * core count), so the "one wave" / "tail wave" points follow the grid. ----
+BH_DRAM_PEAK_GBPS = 512.0  # Blackhole p150: 8 GDDR6 channels
+
+# id: (H, S, T, TOPK, k_chunk, nv[, kv_format]) -- kv_format "scaled_fp8" (default) or "bf16"
+SPARSE_PERF_CASES = {
+    # GLM-5.3 production: 5k chunk over 32 chips -> 160 query rows/chip, all 64 heads after the head->seq
+    # reshard, TOPK 2048, k_chunk 128, scaled-FP8 KV. 160 = one full wave + a 40-core tail on 120 cores.
+    "glm53": (64, 160, 56320, 2048, 128, "dense"),
+    # wave decomposition: tail alone, one full wave
+    "glm53-s40": (64, 40, 56320, 2048, 128, "dense"),
+    "glm53-s1wave": (64, "1cores", 56320, 2048, 128, "dense"),
+    # S=640 (~5.3 tokens/core): DRAM-bound
+    "s640-h64": (64, 640, 56320, 2048, 128, "dense"),
+    "s600-h64": (64, "5cores", 56320, 2048, 128, "dense"),  # 5 full waves, no tail
+    # BF16 KV: no in-op dequant, wider 1152 B rows
+    "bf16-s160": (64, 160, 56320, 2048, 128, "dense", "bf16"),
+}
+
+
+def _resolve_s(S, cores):
+    return int(S[: -len("cores")]) * cores if isinstance(S, str) else S
+
+
+@run_for_blackhole()
+@pytest.mark.parametrize("case", list(SPARSE_PERF_CASES), ids=list(SPARSE_PERF_CASES))
+@skip_with_llk_assert("No need to verify LLK asserts for performance tests.")
+@skip_with_watcher("Watcher perturbs kernel timing; perf checks are not meaningful with it enabled.")
+def test_sparse_sdpa_perf_table(device, case):
+    H, S, T, TOPK, kc, nv, *fmt = SPARSE_PERF_CASES[case]
+    fmt = fmt[0] if fmt else "scaled_fp8"
+    grid = device.compute_with_storage_grid_size()
+    cores = grid.x * grid.y
+    S = _resolve_s(S, cores)
+
+    nv_fn = _NV[nv]
+    q, kv, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: nv_fn(s, T, TOPK))
+    tt_q = to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16)
+    if fmt == "bf16":
+        tt_packed = to_dev(kv.to(torch.bfloat16), device, ttnn.bfloat16)
+        kv_format, kv_elem_bytes = ttnn.transformer.SparseKVFormat.BF16, 2
+    else:
+        tt_latent, tt_scales = ttnn.experimental.deepseek_prefill.per_token_cast_to_fp8(
+            to_dev(kv[..., :V_DIM].to(torch.bfloat16), device, ttnn.bfloat16), round_scale_to_power_of_two=True
+        )
+        tt_packed = ttnn.experimental.deepseek_prefill.pack_scaled_fp8_kv_cache(
+            tt_latent, tt_scales, to_dev(kv[..., V_DIM:].to(torch.bfloat16), device, ttnn.bfloat16)
+        )
+        kv_format, kv_elem_bytes = ttnn.transformer.SparseKVFormat.SCALED_FP8, 1
+    tt_idx = to_dev(indices.to(torch.int32), device, ttnn.uint32)
+    n_valid = sum(max(1, min(TOPK, nv_fn(s, T, TOPK))) for s in range(S))
+
+    def run():
+        return ttnn.transformer.sparse_sdpa(
+            tt_q,
+            tt_packed,
+            tt_idx,
+            V_DIM,
+            kv_format=kv_format,
+            scale=K_DIM**-0.5,
+            k_chunk_size=kc,
+        )
+
+    out = run()  # compile + warm up
+    ttnn.synchronize_device(device)
+
+    row_bytes = tt_packed.shape[-1] * kv_elem_bytes
+    kv_bytes = n_valid * row_bytes  # each query row gathers its own valid rows (shared across heads)
+    other_bytes = H * S * K_DIM * 2 + S * TOPK * 4 + H * S * V_DIM * 2  # q + indices + out
+    total_bytes = kv_bytes + other_bytes
+    msg = (
+        f"[{case}] sparse_sdpa {fmt} H={H} S={S} T={T} TOPK={TOPK} kc={kc} nv={nv} cores={cores} "
+        f"({grid.x}x{grid.y}) rows/core={S / cores:.2f} (max {-(-S // cores)}): row={row_bytes} B, "
+        f"total {total_bytes / 2**20:.1f} MiB, DRAM-roofline {total_bytes / BH_DRAM_PEAK_GBPS / 1e3:.1f} us"
+    )
+    if ttnn.device.IsProgramRealtimeProfilerActive():
+        durations = [profile_realtime_program(device, run)[1]["duration_ns"] for _ in range(5)]
+        dur_ns = statistics.median(durations)
+        gbps = total_bytes / dur_ns
+        msg += (
+            f" | device {dur_ns / 1e3:.1f} us (min {min(durations) / 1e3:.1f}), {gbps:.0f} GB/s = "
+            f"{100 * gbps / BH_DRAM_PEAK_GBPS:.0f}% of peak"
+        )
+    else:
+        for _ in range(3):  # no realtime profiler: a few runs for a Tracy device profile instead
+            out = run()
+        ttnn.synchronize_device(device)
+    logger.info(msg)
+    assert tuple(out.shape) == (1, H, S, V_DIM)
+
+
 @run_for_blackhole()
 @skip_with_watcher("Watcher perturbs host dispatch timing.")
 def test_sparse_sdpa_indexed_cache_hit_host_dispatch_is_cheap(device):

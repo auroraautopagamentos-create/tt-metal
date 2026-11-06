@@ -83,6 +83,9 @@ tt::tt_metal::ProgramDescriptor::CBDescriptors make_cbs(
     const uint32_t Sqt = H / tt::constants::TILE_HEIGHT;       // query tile-rows (32 heads each)
 
     const bool scaled_kv = attrs.has_scaled_kv();
+    // Fused FP8 dequant (one FPU pass for tilize x scale, see kernels/compute/sparse_sdpa_fused_dequant.hpp). The
+    // attention-sink term is added to the row-sum unscaled, so the sink path keeps the two-pass dequant.
+    const bool fused_dequant = scaled_kv && !use_attention_sink;
     const uint32_t idx_elem_bytes = t.indices.element_size();  // uint32 -> 4
     const uint32_t q_row_bytes = k_dim * t.q.element_size();
     const uint32_t k_row_bytes = k_dim * t.kv.element_size();
@@ -170,8 +173,17 @@ tt::tt_metal::ProgramDescriptor::CBDescriptors make_cbs(
     cb(cb_kreq, ::sparse_sdpa::gather_request::PAGE_BYTES, ::sparse_sdpa::CB_DOUBLE_BUFFER_DEPTH, bf);
     cb(cb_kack, ::sparse_sdpa::ACK_PAGE_BYTES, ::sparse_sdpa::CB_DOUBLE_BUFFER_DEPTH, bf);
     if (scaled_kv) {
-        cb(cb_k_scale_bcast, fp32_tile_bytes, scale_blocks * ::sparse_sdpa::CB_DOUBLE_BUFFER_DEPTH, fp32);
-        cb(cb_k_latent_tile, k_in_tile_bytes, vDHt, tt::DataFormat::Bfp8_b);
+        if (fused_dequant) {
+            // FP16 scale tiles. Declared UInt16: the JIT rejects an FP16 (A-exponent) CB next to the BF16 ones, and
+            // compute reprograms srcB to Float16 for the fused multiply.
+            cb(cb_k_scale_bcast,
+               tt::tile_size(tt::DataFormat::UInt16),
+               scale_blocks * ::sparse_sdpa::CB_DOUBLE_BUFFER_DEPTH,
+               tt::DataFormat::UInt16);
+        } else {
+            cb(cb_k_scale_bcast, fp32_tile_bytes, scale_blocks * ::sparse_sdpa::CB_DOUBLE_BUFFER_DEPTH, fp32);
+            cb(cb_k_latent_tile, k_in_tile_bytes, vDHt, tt::DataFormat::Bfp8_b);
+        }
         cb(cb_k_rope_tile, tile_bytes, Skt * (DHt - vDHt), bf);
     }
 
@@ -270,6 +282,7 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     // Element sizes come from the tensors (no hardcoded byte counts); passed to the kernels as compile args.
     const uint32_t q_elem_bytes = t.q.element_size();
     const bool scaled_kv = attrs.has_scaled_kv();
+    const bool fused_dequant = scaled_kv && !use_attention_sink;  // matches make_cbs
     const uint32_t kv_elem_bytes = t.kv.element_size();
     const uint32_t idx_elem_bytes = t.indices.element_size();  // uint32 -> 4
     const uint32_t out_elem_bytes = output.element_size();
@@ -406,6 +419,9 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     reader_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     reader_desc.core_ranges = core_grid;
     reader_desc.compile_time_args = reader_ct;
+    if (fused_dequant) {
+        reader_desc.defines.emplace_back("SPARSE_SDPA_FUSED_DEQUANT", "1");
+    }
     reader_desc.config = tt::tt_metal::ReaderConfigDescriptor{};
 
     tt::tt_metal::KernelDescriptor writer_desc;
@@ -413,6 +429,9 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     writer_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     writer_desc.core_ranges = core_grid;
     writer_desc.compile_time_args = writer_ct;
+    if (fused_dequant) {
+        writer_desc.defines.emplace_back("SPARSE_SDPA_FUSED_DEQUANT", "1");
+    }
     writer_desc.config = tt::tt_metal::WriterConfigDescriptor{};
 
     // Order matches get_compute_kernel_config_args: (fidelity, approx_mode, fp32_dest_acc, packer_l1_acc,
@@ -457,6 +476,9 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     compute_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     compute_desc.core_ranges = core_grid;
     compute_desc.compile_time_args = compute_ct;
+    if (fused_dequant) {
+        compute_desc.defines.emplace_back("SPARSE_SDPA_FUSED_DEQUANT", "1");
+    }
     // fp8 inputs must unpack into a 32-bit dest (fp8 -> fp32 in DEST, then packed to bfp8 cb_*_in).
     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
         NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);

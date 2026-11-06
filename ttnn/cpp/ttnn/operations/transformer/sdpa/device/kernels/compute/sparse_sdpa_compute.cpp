@@ -15,6 +15,7 @@
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/bcast.h"  // add_tiles_bcast_rows (mask add)
+#include "api/compute/eltwise_unary/binop_with_scalar.h"  // fused-dequant Q prescale
 #include "ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/sparse_sdpa_common.hpp"
 constexpr bool EXP_APPROX_MODE = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::MATH_APPROX_MODE) != 0;
 // compute_streaming.hpp needs declarations from compute_common.hpp (LightweightMaskContext, reduce helpers,
@@ -25,6 +26,7 @@ constexpr bool EXP_APPROX_MODE = get_compile_time_arg_val(sparse_sdpa::compute_c
 #include "ttnn/cpp/ttnn/kernel_lib/untilize_helpers.hpp"
 #include "api/dataflow/circular_buffer.h"  // CircularBuffer: COMPILE_FOR_TRISC-aware CB lifecycle
 #include "api/tile_constants.h"            // tt::constants::TILE_HEIGHT
+#include "sparse_sdpa_fused_dequant.hpp"
 
 // In-place scores[tile] += row-broadcast of mask row 0. cb_qk_im is held (hold_wr_ptr), so re-pack at the
 // absolute position. Caller has init'd the bcast-rows op + single-tile pack.
@@ -185,6 +187,11 @@ void kernel_main() {
 
         // tilize Q rows -> [Sqt, DHt]
         compute_kernel_lib::tilize<DHt, cb_q_rm, cb_q_in>(/*num_blocks=*/Sqt, /*total_input_pages=*/H);
+#ifdef SPARSE_SDPA_FUSED_DEQUANT
+        // The fused dequant keeps K latent scaled by 2^FUSED_DEQUANT_EXP_OFFSET; undo it on Q.
+        sparse_sdpa::fused_dequant::prescale_q_latent<cb_q_in, Sqt, DHt, vDHt>();
+        pack_to_unpack_sync();  // in-place Q packs must be visible to the QK unpack
+#endif
 
         // Flash running state, ping-pong. Reset every token; all buffers start empty. A split-K HEAD starts so that
         // its last chunk lands in the b buffers, which the writer sends from.
@@ -220,6 +227,20 @@ void kernel_main() {
                 k_in_cb.reserve_back(Skt * vDHt);
                 for (uint32_t row_tile = 0; row_tile < Skt; ++row_tile) {
                     k_rm_cb.wait_front(tt::constants::TILE_HEIGHT);
+#ifdef SPARSE_SDPA_FUSED_DEQUANT
+                    {
+                        scale_bcast_cb.wait_front(scale_blocks);
+                        sparse_sdpa::fused_dequant::latent_slab<
+                            cb_k_rm,
+                            cb_k_scale_bcast,
+                            cb_k_in,
+                            latent_physical_ct,
+                            scale_blocks,
+                            tiles_per_scale_block,
+                            vDHt>(row_tile);
+                        scale_bcast_cb.pop_front(scale_blocks);
+                    }
+#else
                     {
                         tilize_packed_field<
                             cb_k_rm,
@@ -228,9 +249,7 @@ void kernel_main() {
                             latent_DHt,
                             /*field_offset_16b=*/0,
                             /*manage_input_lifecycle=*/false>();
-                    }
 
-                    {
                         latent_tile_cb.wait_front(latent_DHt);
                         scale_bcast_cb.wait_front(scale_blocks);
                         reconfig_data_format(cb_k_latent_tile, cb_k_scale_bcast);
@@ -250,6 +269,7 @@ void kernel_main() {
                         latent_tile_cb.pop_front(latent_DHt);
                         scale_bcast_cb.pop_front(scale_blocks);
                     }
+#endif
 
                     {
                         // cb_k_rope_rm is a format-only alias: synchronize its UNPACK pointer to the owning

@@ -960,3 +960,28 @@ def test_sparse_sdpa_split_k_plan_follows_free_l1(device):
     for name, out in (("split-K", out_split), ("whole-token", out_whole)):
         score = pcc(ttnn.to_torch(out), expected)
         assert score >= 0.999, f"{name} PCC {score:.5f}"
+
+
+# ---- GLM-5.3 production shape: 160 query rows per chip (more rows than cores, not a multiple of the core count),
+#      all 64 heads (head-to-sequence reshard), TOPK=2048, k_chunk=128, scaled-FP8 KV ----
+@run_for_blackhole()
+@pytest.mark.parametrize("nv_id", ["all", "causal"])
+def test_sparse_sdpa_glm53_production_pcc(device, nv_id):
+    H, S, T, TOPK, kc = 64, 160, 8192, 2048, 128
+    nv_fn = {"all": lambda s: TOPK, "causal": lambda s: min(TOPK, 1 + s * 13)}[nv_id]
+    q, _, indices = make_inputs(H, S, T, TOPK, K_DIM, nv_fn, seed=81)
+    tt_packed, reconstructed = make_scaled_kv_cache(device, 1, T, seed=82, round_scale=True)
+    out = ttnn.transformer.sparse_sdpa(
+        to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16),
+        tt_packed,
+        to_dev(indices.to(torch.int32), device, ttnn.uint32),
+        V_DIM,
+        kv_format=SCALED_FP8_KV,
+        scale=K_DIM**-0.5,
+        k_chunk_size=kc,
+    )
+    expected = golden(q, reconstructed, indices, K_DIM**-0.5, V_DIM)
+    actual = ttnn.to_torch(out)
+    score = pcc(actual, expected)
+    worst = min(pcc(actual[:, :, s], expected[:, :, s]) for s in range(S))
+    assert score >= 0.999 and worst >= 0.995, f"GLM-5.3 sparse SDPA PCC {score:.5f}, worst token {worst:.5f}"

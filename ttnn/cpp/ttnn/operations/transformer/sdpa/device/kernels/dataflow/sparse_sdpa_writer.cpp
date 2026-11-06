@@ -103,7 +103,11 @@ void kernel_main() {
 
     // Col-identity (column 0 = 1.0): compute matmul-reduces the partial row-sum against it to finalize the
     // within-tile reduction in normalize_row_streaming.
-    generate_bcast_col_scalar(CircularBuffer(cb_col_identity), one_bf16_packed);
+    // With the fused dequant, V (the K latent) arrives scaled by 2^FUSED_DEQUANT_EXP_OFFSET; scale the row-sum
+    // by the same power of two so out/sum is unchanged.
+    constexpr uint32_t identity_bf16 =
+        sparse_sdpa::FUSED_DEQUANT ? (127u + sparse_sdpa::FUSED_DEQUANT_EXP_OFFSET) << 7 : one_bf16_packed >> 16;
+    generate_bcast_col_scalar(CircularBuffer(cb_col_identity), (identity_bf16 << 16) | identity_bf16);
 
     // All-(-inf) tile (row 0; compute bcast-adds it to fully-masked key tiles). Only row 0 matters for the
     // row-broadcast add: the left and right half-rows live in face 0 and face 1 respectively.

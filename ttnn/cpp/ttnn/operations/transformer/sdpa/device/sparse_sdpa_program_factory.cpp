@@ -520,8 +520,8 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
         // With every core gathering K at once, a Blackhole core's gather speed depends on its NoC row: the top
         // rows (NoC0 y=2, 3) are the slowest and the bottom (y=11) the fastest, the same on every chip measured.
         // An equal split leaves the top rows finishing last, so give each row units in proportion to these
-        // weights (in %, tuned on a p150 12x10 grid with the GLM-5.3 shape).
-        constexpr std::array<uint32_t, 10> ROW_SPEED_PCT = {80, 78, 84, 96, 102, 109, 113, 116, 118, 120};
+        // weights (in %, tuned on a p150 12x10 grid for the GLM-5.3 (64 heads) and Kimi K3.1 (96 heads) shapes).
+        constexpr std::array<uint32_t, 10> ROW_SPEED_PCT = {85, 84, 88, 97, 102, 107, 110, 112, 114, 115};
         constexpr uint32_t FIRST_ROW_Y = 2;
         for (uint32_t i = 0; i < num_used; ++i) {
             const uint32_t y = device->worker_core_from_logical_core(cores[i]).y;

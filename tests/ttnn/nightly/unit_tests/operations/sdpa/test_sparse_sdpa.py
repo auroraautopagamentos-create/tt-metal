@@ -324,6 +324,9 @@ SPARSE_PERF_CASES = {
     # wave decomposition: tail alone, one full wave
     "glm53-s40": (64, 40, 56320, 2048, 128, "dense"),
     "glm53-s1wave": (64, "1cores", 56320, 2048, 128, "dense"),
+    # Kimi K3.1 production: same chunk and mesh as GLM-5.3 (160 rows/chip after the head->seq reshard), 96 heads
+    "k31": (96, 160, 56320, 2048, 128, "dense"),
+    "k31-s1wave": (96, "1cores", 56320, 2048, 128, "dense"),
     # S=640 (~5.3 tokens/core): DRAM-bound
     "s640-h64": (64, 640, 56320, 2048, 128, "dense"),
     "s600-h64": (64, "5cores", 56320, 2048, 128, "dense"),  # 5 full waves, no tail

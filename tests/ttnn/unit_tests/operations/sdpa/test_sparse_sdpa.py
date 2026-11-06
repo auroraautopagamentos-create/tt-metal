@@ -962,12 +962,13 @@ def test_sparse_sdpa_split_k_plan_follows_free_l1(device):
         assert score >= 0.999, f"{name} PCC {score:.5f}"
 
 
-# ---- GLM-5.3 production shape: 160 query rows per chip (more rows than cores, not a multiple of the core count),
-#      all 64 heads (head-to-sequence reshard), TOPK=2048, k_chunk=128, scaled-FP8 KV ----
+# ---- production shapes: 160 query rows per chip (more rows than cores, not a multiple of the core count), all
+#      heads after the head-to-sequence reshard (GLM-5.3: 64, Kimi K3.1: 96), TOPK=2048, k_chunk=128, scaled-FP8 KV ----
 @run_for_blackhole()
+@pytest.mark.parametrize("H", [64, 96], ids=["glm53", "k31"])
 @pytest.mark.parametrize("nv_id", ["all", "causal"])
-def test_sparse_sdpa_glm53_production_pcc(device, nv_id):
-    H, S, T, TOPK, kc = 64, 160, 8192, 2048, 128
+def test_sparse_sdpa_production_pcc(device, H, nv_id):
+    S, T, TOPK, kc = 160, 8192, 2048, 128
     nv_fn = {"all": lambda s: TOPK, "causal": lambda s: min(TOPK, 1 + s * 13)}[nv_id]
     q, _, indices = make_inputs(H, S, T, TOPK, K_DIM, nv_fn, seed=81)
     tt_packed, reconstructed = make_scaled_kv_cache(device, 1, T, seed=82, round_scale=True)
@@ -984,7 +985,7 @@ def test_sparse_sdpa_glm53_production_pcc(device, nv_id):
     actual = ttnn.to_torch(out)
     score = pcc(actual, expected)
     worst = min(pcc(actual[:, :, s], expected[:, :, s]) for s in range(S))
-    assert score >= 0.999 and worst >= 0.995, f"GLM-5.3 sparse SDPA PCC {score:.5f}, worst token {worst:.5f}"
+    assert score >= 0.999 and worst >= 0.995, f"H={H} sparse SDPA PCC {score:.5f}, worst token {worst:.5f}"
 
 
 # ---- fused dequant scale range: magnitudes, not just correlation (PCC passes for a uniformly rescaled output) ----

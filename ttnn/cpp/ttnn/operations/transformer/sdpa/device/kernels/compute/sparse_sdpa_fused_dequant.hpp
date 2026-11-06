@@ -64,7 +64,9 @@ inline void unpack_tile(uint32_t address_a, uint32_t address_b) {
 #endif
 
 #ifdef TRISC_MATH
-// LoFi is exact here: the FP8 srcA has 4 significant bits and the scale is a power of two.
+// One LoFi pass regardless of the op's math fidelity: exact for the FP8 srcA (4 significant bits) times a
+// power-of-two scale (the production cast, round_scale_to_power_of_two=True). An arbitrary scale keeps only
+// srcB's LoFi bits (~7), about the precision the two-pass path's BFP8 intermediate kept.
 inline void math_init() {
     addr_mod_t{.srca = {.incr = 8}, .srcb = {.incr = 8}, .dest = {.incr = 8}}.set(ADDR_MOD_2);
     ckernel_template tmp(1, 8, TT_OP_ELWMUL(0, 0, p_elwise::SRCB_BCAST_COL, ADDR_MOD_2, 0));

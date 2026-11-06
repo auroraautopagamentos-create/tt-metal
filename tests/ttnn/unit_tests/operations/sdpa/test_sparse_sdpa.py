@@ -985,3 +985,99 @@ def test_sparse_sdpa_glm53_production_pcc(device, nv_id):
     score = pcc(actual, expected)
     worst = min(pcc(actual[:, :, s], expected[:, :, s]) for s in range(S))
     assert score >= 0.999 and worst >= 0.995, f"GLM-5.3 sparse SDPA PCC {score:.5f}, worst token {worst:.5f}"
+
+
+# ---- fused dequant scale range: magnitudes, not just correlation (PCC passes for a uniformly rescaled output) ----
+# Per-128-column block amax targets: below the cast's 1e-4 clamp, just above it (an unrounded scale of ~2^-22.1),
+# mid-range, and large (a power-of-two scale of 2^7, the top FP16 binade after the 2^9 offset).
+SCALE_RANGE_AMAX = (5e-5, 1.05e-4, 3.0, 4.0e4)
+
+
+@run_for_blackhole()
+@pytest.mark.parametrize("round_scale", [True, False], ids=["pow2_scale", "arbitrary_scale"])
+def test_sparse_sdpa_scaled_fp8_scale_range(device, round_scale):
+    H, S, T, TOPK, kc = 32, 32, 256, 128, 64
+    q, _, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: 1 + (s * 7) % TOPK, seed=91)
+    # Zero Q's latent so the scores come from the BF16 RoPE alone: the 4e4 block would otherwise make the logits
+    # so large that rounding decides the softmax. The output still reads every dequantized latent block as V.
+    q[..., :V_DIM] = 0
+    gen = torch.Generator().manual_seed(92)
+    latent = torch.randn(1, 1, T, V_DIM, generator=gen).reshape(1, 1, T, -1, SCALE_BLOCK_WIDTH)
+    latent = latent / latent.abs().amax(-1, keepdim=True) * torch.tensor(SCALE_RANGE_AMAX).reshape(-1, 1)
+    latent = latent.reshape(1, 1, T, V_DIM)
+    rope = torch.randn(1, 1, T, K_DIM - V_DIM, generator=gen).to(torch.bfloat16)
+    tt_fp8, tt_scales = ttnn.experimental.deepseek_prefill.per_token_cast_to_fp8(
+        to_dev(latent.to(torch.bfloat16), device, ttnn.bfloat16), round_scale_to_power_of_two=round_scale
+    )
+    tt_packed = ttnn.experimental.deepseek_prefill.pack_scaled_fp8_kv_cache(
+        tt_fp8, tt_scales, to_dev(rope, device, ttnn.bfloat16)
+    )
+    back = ttnn.experimental.deepseek_prefill.per_token_cast_back(tt_fp8, tt_scales, output_dtype=ttnn.bfloat16)
+    reconstructed = torch.cat([ttnn.to_torch(back).float(), rope.float()], dim=-1)
+    out = ttnn.transformer.sparse_sdpa(
+        to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16),
+        tt_packed,
+        to_dev(indices.to(torch.int32), device, ttnn.uint32),
+        V_DIM,
+        kv_format=SCALED_FP8_KV,
+        scale=K_DIM**-0.5,
+        k_chunk_size=kc,
+    )
+    actual = ttnn.to_torch(out).float()
+    expected = golden(q, reconstructed, indices, K_DIM**-0.5, V_DIM)
+    for b, amax in enumerate(SCALE_RANGE_AMAX):
+        cols = slice(b * SCALE_BLOCK_WIDTH, (b + 1) * SCALE_BLOCK_WIDTH)
+        ref = expected[..., cols].abs().max()
+        err = (actual[..., cols] - expected[..., cols]).abs().max() / ref
+        assert err < 0.03, f"block {b} (amax {amax}): max error {err:.4f} of the block's max |out| {ref:.3e}"
+
+
+# ---- scaled FP8 KV with an attention sink keeps the two-pass dequant ----
+@run_for_blackhole()
+def test_sparse_sdpa_scaled_fp8_attention_sink(device):
+    H, S, T, TOPK, kc = 32, 32, 256, 128, 64
+    q, _, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: 1 + (s * 7) % TOPK, seed=93)
+    tt_packed, reconstructed = make_scaled_kv_cache(device, 1, T, seed=94, round_scale=True)
+    scale = K_DIM**-0.5
+    sinks = (torch.linspace(-4, 8, H) / scale).reshape(1, 1, 1, H).to(torch.bfloat16)
+    out = ttnn.transformer.sparse_sdpa(
+        to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16),
+        tt_packed,
+        to_dev(indices.to(torch.int32), device, ttnn.uint32),
+        V_DIM,
+        kv_format=SCALED_FP8_KV,
+        scale=scale,
+        k_chunk_size=kc,
+        attention_sink=to_dev(sinks, device, ttnn.bfloat16),
+    )
+    actual = ttnn.to_torch(out).float()
+    expected = golden(q, reconstructed, indices, scale, V_DIM, attention_sink=sinks.float().reshape(1, H, 1, 1))
+    score = pcc(actual, expected)
+    assert score >= 0.999, f"scaled FP8 + sink PCC {score:.5f}"
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)  # latent values up to ~4
+
+
+# ---- FP8 Q with scaled FP8 KV: the fused-dequant Q prescale runs on the BFP8 cb_q_in ----
+@run_for_blackhole()
+def test_sparse_sdpa_scaled_fp8_kv_fp8_q(device):
+    H, S, T, TOPK, kc = 32, 32, 256, 128, 64
+    q, _, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: TOPK, seed=95)
+    tt_packed, reconstructed = make_scaled_kv_cache(device, 1, T, seed=96, round_scale=True)
+    tt_q = to_dev(q.to(torch.float32), device, ttnn.fp8_e4m3)
+    q_ref = q.to(torch.float8_e4m3fn).float()  # the FP8-rounded Q the op sees
+    out = ttnn.transformer.sparse_sdpa(
+        tt_q,
+        tt_packed,
+        to_dev(indices.to(torch.int32), device, ttnn.uint32),
+        V_DIM,
+        kv_format=SCALED_FP8_KV,
+        scale=K_DIM**-0.5,
+        k_chunk_size=kc,
+    )
+    actual = ttnn.to_torch(ttnn.typecast(out, ttnn.bfloat16)).float()  # no FP8 to_torch
+    expected = golden(q_ref, reconstructed, indices, K_DIM**-0.5, V_DIM)
+    score = pcc(actual, expected)
+    assert score >= 0.99, f"FP8 Q + scaled FP8 KV PCC {score:.5f}"
+    # FP8 output: compare magnitudes coarsely (PCC alone would pass a rescaled output).
+    ratio = actual.norm() / expected.norm()
+    assert 0.95 < ratio < 1.05, f"output norm ratio {ratio:.4f}"

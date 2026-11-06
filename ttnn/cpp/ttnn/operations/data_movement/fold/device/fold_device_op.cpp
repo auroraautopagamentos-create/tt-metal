@@ -50,6 +50,14 @@ void validate_fold(const std::vector<Tensor>& input_tensors, uint32_t stride_h, 
 
     TT_FATAL(input_tensor.storage_type() == StorageType::DEVICE, "Fold: Expect input tensor to be stored on device.");
     TT_FATAL(input_tensor.is_allocated(), "Fold: Expect input tensor to be allocated on a device buffer.");
+    // Row-major pixels are copied byte for byte, so the output must keep the input's dtype.
+    TT_FATAL(
+        input_tensor.layout() != tt::tt_metal::Layout::ROW_MAJOR ||
+            fold_output_dtype(input_tensor.dtype()) == input_tensor.dtype(),
+        "Fold: row-major {} input is not supported: fold copies row-major pixels unchanged and outputs {}. Use "
+        "BFLOAT16, FLOAT32 or UINT16.",
+        input_tensor.dtype(),
+        fold_output_dtype(input_tensor.dtype()));
 
     // Reject zero strides before any modulo/div; guards both fast + composite paths and compute_output_specs.
     TT_FATAL(stride_h > 0 && stride_w > 0, "Fold: stride_h ({}) and stride_w ({}) must be > 0.", stride_h, stride_w);

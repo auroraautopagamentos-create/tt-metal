@@ -550,6 +550,8 @@ TWO_CORES, SQUARE, ONE_CORE = ((0, 0), (1, 0)), ((0, 0), (1, 1)), ((0, 0), (0, 0
         ((1, 4, 8, 3), ttnn.bfloat16, _legacy_config(HEIGHT, L1, TWO_CORES, [16, 8])),
         ((1, 4, 8, 8), ttnn.bfloat16, _legacy_config(HEIGHT, L1, TWO_CORES, [16, 16])),
         ((1, 4, 8, 3), ttnn.float32, _legacy_config(HEIGHT, L1, TWO_CORES, [16, 8])),
+        ((1, 4, 8, 16), ttnn.bfloat16, _legacy_config(HEIGHT, L1, TWO_CORES, [16, 32])),
+        ((1, 4, 8, 4), ttnn.float32, _legacy_config(HEIGHT, L1, TWO_CORES, [16, 8])),
         ((1, 4, 8, 3), ttnn.bfloat16, _legacy_config(HEIGHT, DRAM, TWO_CORES, [16, 8])),
         ((1, 4, 8, 24), ttnn.bfloat16, _legacy_config(WIDTH, L1, TWO_CORES, [32, 16])),
         ((1, 4, 8, 24), ttnn.float32, _legacy_config(WIDTH, L1, TWO_CORES, [32, 16])),
@@ -563,6 +565,8 @@ TWO_CORES, SQUARE, ONE_CORE = ((0, 0), (1, 0)), ((0, 0), (1, 1)), ((0, 0), (0, 0
         "height_l1_c3",
         "height_l1_c8_shard16",
         "height_l1_c3_fp32",
+        "height_l1_c16_shard32",
+        "height_l1_c4_shard8_fp32",
         "height_dram_c3",
         "width_l1_c24",
         "width_l1_c24_fp32",
@@ -720,3 +724,18 @@ def test_fold_nd_sharded_subaligned_input_rows(device):
 
     assert tt_out.memory_config().is_sharded(), tt_out.memory_config()
     assert_equal(fold_torch(torch_input, 2, 2), ttnn.to_torch(tt_out))
+
+
+@pytest.mark.parametrize("dtype", [ttnn.int32, ttnn.uint32, ttnn.uint8], ids=["int32", "uint32", "uint8"])
+@pytest.mark.parametrize("buffer_type", [L1, DRAM], ids=["height_l1", "dram_interleaved"])
+def test_fold_rejects_row_major_dtypes_it_cannot_copy(device, dtype, buffer_type, expect_error):
+    """Fold outputs these dtypes as bfloat16 but copies row-major pixels byte for byte, so it rejects them."""
+    shape = (1, 4, 8, 8)
+    torch_input = (torch.arange(math.prod(shape)) % 100 + 1).reshape(shape).to(torch.int32)
+    memory_config = _legacy_config(HEIGHT, L1, TWO_CORES, [16, 8]) if buffer_type == L1 else ttnn.DRAM_MEMORY_CONFIG
+    tt_input = ttnn.from_torch(
+        torch_input, dtype=dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device, memory_config=memory_config
+    )
+
+    with expect_error(RuntimeError, "row-major .* input is not supported"):
+        ttnn.fold(tt_input, 2, 2)

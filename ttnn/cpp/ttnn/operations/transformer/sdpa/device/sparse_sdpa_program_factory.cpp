@@ -343,6 +343,7 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
         reader_ct.end(),
         {static_cast<uint32_t>(scaled_kv), v_dim, cb_k_scale_bcast, packed_page_bytes, cb_kreq, cb_kack});
     reader_ct.push_back(static_cast<uint32_t>(split_k));
+    reader_ct.push_back(static_cast<uint32_t>(fused_dequant));
     TT_FATAL(
         reader_ct.size() == ::sparse_sdpa::reader_ct_arg::END,
         "sparse_sdpa reader compile-time argument layout is out of sync");
@@ -374,6 +375,7 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
          cb_recv_max,
          cb_recv_sum,
          cb_merge_ctrl});
+    writer_ct.push_back(static_cast<uint32_t>(fused_dequant));
     TT_FATAL(
         writer_ct.size() == ::sparse_sdpa::writer_ct_arg::END,
         "sparse_sdpa writer compile-time argument layout is out of sync");
@@ -420,9 +422,6 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     reader_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     reader_desc.core_ranges = core_grid;
     reader_desc.compile_time_args = reader_ct;
-    if (fused_dequant) {
-        reader_desc.defines.emplace_back("SPARSE_SDPA_FUSED_DEQUANT", "1");
-    }
     reader_desc.config = tt::tt_metal::ReaderConfigDescriptor{};
 
     tt::tt_metal::KernelDescriptor writer_desc;
@@ -430,9 +429,6 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     writer_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     writer_desc.core_ranges = core_grid;
     writer_desc.compile_time_args = writer_ct;
-    if (fused_dequant) {
-        writer_desc.defines.emplace_back("SPARSE_SDPA_FUSED_DEQUANT", "1");
-    }
     writer_desc.config = tt::tt_metal::WriterConfigDescriptor{};
 
     // Order matches get_compute_kernel_config_args: (fidelity, approx_mode, fp32_dest_acc, packer_l1_acc,
@@ -468,6 +464,7 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
          cb_recv_sum,
          cb_merge_ctrl,
          cb_corr2});
+    compute_ct.push_back(static_cast<uint32_t>(fused_dequant));
     TT_FATAL(
         compute_ct.size() == ::sparse_sdpa::compute_ct_arg::END,
         "sparse_sdpa compute compile-time argument layout is out of sync");
@@ -477,9 +474,6 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     compute_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
     compute_desc.core_ranges = core_grid;
     compute_desc.compile_time_args = compute_ct;
-    if (fused_dequant) {
-        compute_desc.defines.emplace_back("SPARSE_SDPA_FUSED_DEQUANT", "1");
-    }
     // fp8 inputs must unpack into a 32-bit dest (fp8 -> fp32 in DEST, then packed to bfp8 cb_*_in).
     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
         NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);

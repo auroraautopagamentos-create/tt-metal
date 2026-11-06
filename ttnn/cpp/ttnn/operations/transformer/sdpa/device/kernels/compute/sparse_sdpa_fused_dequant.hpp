@@ -20,9 +20,6 @@
 // is reprogrammed to Float16 here.
 #pragma once
 
-// Only built when the factory selects the fused path (scaled FP8 KV is Blackhole-only).
-#ifdef SPARSE_SDPA_FUSED_DEQUANT
-
 #include "ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/sparse_sdpa_common.hpp"
 
 namespace sparse_sdpa::fused_dequant {
@@ -163,5 +160,3 @@ ALWI void prescale_q_latent() {
 }
 
 }  // namespace sparse_sdpa::fused_dequant
-
-#endif  // SPARSE_SDPA_FUSED_DEQUANT

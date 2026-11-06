@@ -56,6 +56,7 @@ void kernel_main() {
     constexpr uint32_t bc_shard_stride_gap = get_compile_time_arg_val(sparse_sdpa::reader_ct_arg::BC_SHARD_STRIDE_GAP);
     constexpr uint32_t bc_slab_stride_gap = get_compile_time_arg_val(sparse_sdpa::reader_ct_arg::BC_SLAB_STRIDE_GAP);
     constexpr bool scaled_kv = get_compile_time_arg_val(sparse_sdpa::reader_ct_arg::SCALED_KV) != 0;
+    constexpr bool fused_dequant = get_compile_time_arg_val(sparse_sdpa::reader_ct_arg::FUSED_DEQUANT) != 0;
     constexpr uint32_t latent_width = get_compile_time_arg_val(sparse_sdpa::reader_ct_arg::LATENT_WIDTH);
     constexpr uint32_t cb_k_scale_bcast = get_compile_time_arg_val(sparse_sdpa::reader_ct_arg::CB_K_SCALE_BCAST);
     constexpr uint32_t packed_row_bytes = get_compile_time_arg_val(sparse_sdpa::reader_ct_arg::PACKED_ROW_BYTES);
@@ -209,7 +210,7 @@ void kernel_main() {
                         noc, kv, k_write_ptr, idx_ptr, slab_base, split, rows, packed_row_bytes, kv_batch_page_offset);
                     // Expand the scale rows from the reader's gathered half while the writer handles its
                     // own half. The two RISCs write disjoint rows of the same FP32 broadcast tiles.
-                    sparse_sdpa::scatter_packed_scales<scale_blocks>(
+                    sparse_sdpa::scatter_packed_scales<scale_blocks, fused_dequant>(
                         k_write_ptr, scale_write_ptr, split, rows, packed_row_bytes, latent_row_bytes);
                     kack_cb.wait_front(1);
                     kack_cb.pop_front(1);
@@ -222,7 +223,8 @@ void kernel_main() {
                         noc.write_zeros_l1_barrier();
                     }
                     // Zero the scale rows for the padded suffix after both real-row halves have joined.
-                    sparse_sdpa::clear_scale_rows<scale_blocks>(scale_write_ptr, rows, tt::constants::TILE_HEIGHT);
+                    sparse_sdpa::clear_scale_rows<scale_blocks, fused_dequant>(
+                        scale_write_ptr, rows, tt::constants::TILE_HEIGHT);
                     k_cb.push_back(tt::constants::TILE_HEIGHT);
                     scale_bcast_cb.push_back(scale_blocks);
                 }

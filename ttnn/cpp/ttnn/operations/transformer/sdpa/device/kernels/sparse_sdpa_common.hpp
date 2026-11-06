@@ -144,6 +144,7 @@ enum : uint32_t {
     CB_KREQ,
     CB_KACK,
     SPLIT_K,
+    FUSED_DEQUANT,  // scaled KV without sink: compute fuses tilize x scale (FP16 scale tiles)
     END,
 };
 }  // namespace reader_ct_arg
@@ -183,6 +184,7 @@ enum : uint32_t {
     CB_RECV_MAX,
     CB_RECV_SUM,
     CB_MERGE_CTRL,
+    FUSED_DEQUANT,
     END,
 };
 }  // namespace writer_ct_arg
@@ -232,6 +234,7 @@ enum : uint32_t {
     CB_RECV_SUM,
     CB_MERGE_CTRL,
     CB_CORR2,
+    FUSED_DEQUANT,
     END,
 };
 }  // namespace compute_ct_arg

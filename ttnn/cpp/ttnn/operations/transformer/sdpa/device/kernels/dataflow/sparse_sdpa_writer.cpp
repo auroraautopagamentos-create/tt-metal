@@ -38,6 +38,7 @@ void kernel_main() {
     constexpr uint32_t bc_shard_stride_gap = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::BC_SHARD_STRIDE_GAP);
     constexpr uint32_t bc_slab_stride_gap = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::BC_SLAB_STRIDE_GAP);
     constexpr bool scaled_kv = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::SCALED_KV) != 0;
+    constexpr bool fused_dequant = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::FUSED_DEQUANT) != 0;
     constexpr uint32_t k_dim = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::K_DIM);
     constexpr uint32_t kv_elem_bytes = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::KV_ELEM_BYTES);
     constexpr uint32_t cb_idx = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::CB_IDX);
@@ -106,7 +107,7 @@ void kernel_main() {
     // With the fused dequant, V (the K latent) arrives scaled by 2^FUSED_DEQUANT_EXP_OFFSET; scale the row-sum
     // by the same power of two so out/sum is unchanged.
     constexpr uint32_t identity_bf16 =
-        sparse_sdpa::FUSED_DEQUANT ? (127u + sparse_sdpa::FUSED_DEQUANT_EXP_OFFSET) << 7 : one_bf16_packed >> 16;
+        fused_dequant ? (127u + sparse_sdpa::FUSED_DEQUANT_EXP_OFFSET) << 7 : one_bf16_packed >> 16;
     generate_bcast_col_scalar(CircularBuffer(cb_col_identity), (identity_bf16 << 16) | identity_bf16);
 
     // All-(-inf) tile (row 0; compute bcast-adds it to fully-masked key tiles). Only row 0 matters for the
@@ -214,7 +215,7 @@ void kernel_main() {
                     bc_slab_stride_gap,
                     sparse_sdpa::SCALED_K_TRID_RING>(
                     noc, kv, dst_l1, idx_ptr, base, 0, split, packed_row_bytes, kv_batch_page_offset);
-                sparse_sdpa::scatter_packed_scales<scale_blocks>(
+                sparse_sdpa::scatter_packed_scales<scale_blocks, fused_dequant>(
                     dst_l1, scale_dst_l1, 0, split, packed_row_bytes, latent_row_bytes);
             } else {
                 sparse_sdpa::trid_ring_gather<

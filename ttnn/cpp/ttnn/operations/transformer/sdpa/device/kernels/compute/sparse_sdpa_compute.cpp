@@ -124,6 +124,7 @@ void kernel_main() {
     constexpr uint32_t cb_col_identity = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::CB_COL_IDENTITY);
     constexpr uint32_t cb_recip_scratch = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::CB_RECIP_SCRATCH);
     constexpr bool scaled_kv = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::SCALED_KV) != 0;
+    constexpr bool fused_dequant = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::FUSED_DEQUANT) != 0;
     constexpr uint32_t cb_k_rope_rm = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::CB_K_ROPE_RM);
     constexpr uint32_t cb_k_scale_bcast = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::CB_K_SCALE_BCAST);
     constexpr uint32_t cb_k_latent_tile = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::CB_K_LATENT_TILE);
@@ -187,11 +188,11 @@ void kernel_main() {
 
         // tilize Q rows -> [Sqt, DHt]
         compute_kernel_lib::tilize<DHt, cb_q_rm, cb_q_in>(/*num_blocks=*/Sqt, /*total_input_pages=*/H);
-#ifdef SPARSE_SDPA_FUSED_DEQUANT
-        // The fused dequant keeps K latent scaled by 2^FUSED_DEQUANT_EXP_OFFSET; undo it on Q.
-        sparse_sdpa::fused_dequant::prescale_q_latent<cb_q_in, Sqt, DHt, vDHt>();
-        pack_to_unpack_sync();  // in-place Q packs must be visible to the QK unpack
-#endif
+        if constexpr (fused_dequant) {
+            // The fused dequant keeps K latent scaled by 2^FUSED_DEQUANT_EXP_OFFSET; undo it on Q.
+            sparse_sdpa::fused_dequant::prescale_q_latent<cb_q_in, Sqt, DHt, vDHt>();
+            pack_to_unpack_sync();  // in-place Q packs must be visible to the QK unpack
+        }
 
         // Flash running state, ping-pong. Reset every token; all buffers start empty. A split-K HEAD starts so that
         // its last chunk lands in the b buffers, which the writer sends from.
@@ -227,8 +228,7 @@ void kernel_main() {
                 k_in_cb.reserve_back(Skt * vDHt);
                 for (uint32_t row_tile = 0; row_tile < Skt; ++row_tile) {
                     k_rm_cb.wait_front(tt::constants::TILE_HEIGHT);
-#ifdef SPARSE_SDPA_FUSED_DEQUANT
-                    {
+                    if constexpr (fused_dequant) {
                         scale_bcast_cb.wait_front(scale_blocks);
                         sparse_sdpa::fused_dequant::latent_slab<
                             cb_k_rm,
@@ -239,9 +239,7 @@ void kernel_main() {
                             tiles_per_scale_block,
                             vDHt>(row_tile);
                         scale_bcast_cb.pop_front(scale_blocks);
-                    }
-#else
-                    {
+                    } else {
                         tilize_packed_field<
                             cb_k_rm,
                             cb_k_latent_tile,
@@ -269,7 +267,6 @@ void kernel_main() {
                         latent_tile_cb.pop_front(latent_DHt);
                         scale_bcast_cb.pop_front(scale_blocks);
                     }
-#endif
 
                     {
                         // cb_k_rope_rm is a format-only alias: synchronize its UNPACK pointer to the owning

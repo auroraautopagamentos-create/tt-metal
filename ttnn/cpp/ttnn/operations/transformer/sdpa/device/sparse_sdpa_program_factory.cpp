@@ -16,6 +16,7 @@
 #include <array>
 #include <bit>
 #include <string>
+#include <vector>
 
 namespace ttnn::prim {
 
@@ -514,6 +515,35 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     writer_desc.common_runtime_args.insert(writer_desc.common_runtime_args.end(), writer_crt.begin(), writer_crt.end());
 
     const uint64_t total_units = static_cast<uint64_t>(S) * n_chunks;
+    // Split-K unit boundaries: cum_w[i] is the weight of cores [0, i); core i owns units
+    // [total * cum_w[i] / cum_w[num_used], total * cum_w[i + 1] / cum_w[num_used]).
+    std::vector<uint64_t> cum_w(num_used + 1);
+    for (uint32_t i = 0; i <= num_used; ++i) {
+        cum_w[i] = i;
+    }
+    const auto boundary = [&](uint32_t i) { return total_units * cum_w[i] / cum_w[num_used]; };
+    if (split_k && S > num_cores && device->arch() == tt::ARCH::BLACKHOLE) {
+        // With every core gathering K at once, a Blackhole core's gather speed depends on its NoC row: the top
+        // rows (NoC0 y=2, 3) are the slowest and the bottom (y=11) the fastest, the same on every chip measured.
+        // An equal split leaves the top rows finishing last, so give each row units in proportion to these
+        // weights (in %, tuned on a p150 12x10 grid with the GLM-5.3 shape).
+        constexpr std::array<uint32_t, 10> ROW_SPEED_PCT = {80, 78, 84, 96, 102, 109, 113, 116, 118, 120};
+        constexpr uint32_t FIRST_ROW_Y = 2;
+        for (uint32_t i = 0; i < num_used; ++i) {
+            const uint32_t y = device->worker_core_from_logical_core(cores[i]).y;
+            const uint32_t r = y - FIRST_ROW_Y;  // wraps for y < 2 -> default weight
+            cum_w[i + 1] = cum_w[i] + (r < ROW_SPEED_PCT.size() ? ROW_SPEED_PCT[r] : 100u);
+        }
+        // The pairwise merge needs >= one token of units per core; otherwise keep the equal split.
+        for (uint32_t i = 0; i < num_used; ++i) {
+            if (boundary(i + 1) - boundary(i) < n_chunks) {
+                for (uint32_t j = 0; j <= num_used; ++j) {
+                    cum_w[j] = j;
+                }
+                break;
+            }
+        }
+    }
     for (uint32_t i = 0; i < num_cores; ++i) {
         const auto& core = cores[i];
         uint32_t tok_start = i * base + std::min(i, extra);
@@ -524,8 +554,8 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
             tok_count = 0;
         } else if (split_k) {
             // Core i owns units [b0, b1) of the token-major (token, chunk) order.
-            const uint64_t b0 = total_units * i / num_used;
-            const uint64_t b1 = total_units * (i + 1) / num_used;
+            const uint64_t b0 = boundary(i);
+            const uint64_t b1 = boundary(i + 1);
             const uint32_t t0 = b0 / n_chunks, c0 = b0 % n_chunks, t1 = b1 / n_chunks, c1 = b1 % n_chunks;
             // S > cores: >= one token of units per core. S < cores: a range may be shorter than a token but must
             // touch a token boundary, so every token straddles at most two cores (pairwise merge).
